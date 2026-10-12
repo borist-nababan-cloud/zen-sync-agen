@@ -1,0 +1,42 @@
+# Directories to ignore
+Win32/
+docs/
+__recovery/
+__history/
+.antigraviy/
+.idea/
+.vscode/
+
+# Sensitive data and configuration files
+.env
+*.env
+*.sql
+*.ini
+config.json
+*.json
+*.tmp
+*.log
+*.txt
+SyncLogs_*.txt
+
+# Python utility scripts
+inject_pos_sync.py
+__pycache__/
+
+# Markdown documentation files
+*.md
+!README.md
+
+# Delphi generated files and compiled binaries
+*.dcu
+*.local
+*.identcache
+*.stat
+*.exe
+*.dll
+*.bpl
+*.dcp
+*.dsk
+*.cfg
+*.ddp
+*.~*

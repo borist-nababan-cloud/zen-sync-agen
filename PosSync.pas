@@ -1,24 +1,29 @@
 procedure TfrmMain.SyncPosTransPayment(const LastSyncStr, TargetSyncStr: String);
 var
-  qryLocal, qrySearchLocal: TMyQuery;
+  qryLocal, qrySearchMaster, qrySearchDetail: TMyQuery;
   HTTP: THTTPClient;
-  JSONPayload, JSONMember, UpdatePayload: ISuperObject;
-  BulkPayment, BulkMember: ISuperArray;
+  JSONPayload, JSONMember, JSONMasterRow, JSONDetailRow: ISuperObject;
+  BulkPayment, BulkMember, BulkLinkedMaster, BulkLinkedDetail: ISuperArray;
   Response: IHTTPResponse;
   RecCount: Integer;
-  TransIDList: TStringList;
-  Headers, HeadersReturnMinimal: TNetHeaders;
-  RequestBody, RequestBodyInner: TStringStream;
+  Headers: TNetHeaders;
+  RequestBody: TStringStream;
+  sCurIdPayment: String;
 begin
   qryLocal := TMyQuery.Create(nil);
-  qrySearchLocal := TMyQuery.Create(nil);
+  qrySearchMaster := TMyQuery.Create(nil);
+  qrySearchDetail := TMyQuery.Create(nil);
   HTTP := THTTPClient.Create;
-  TransIDList := TStringList.Create;
   try
-    qrySearchLocal.Connection := DMDB.dbInternal;
+    qrySearchMaster.Connection := DMDB.dbInternal;
+    qrySearchDetail.Connection := DMDB.dbInternal;
     
     qryLocal.Connection := DMDB.dbInternal;
-    qryLocal.SQL.Text := 'SELECT * FROM trans_payment WHERE notes > :LastSync AND notes <= :TargetSync ORDER BY notes ASC';
+    qryLocal.SQL.Text := 
+      'SELECT * FROM trans_payment ' +
+      'WHERE ((CONCAT(tanggal, '' '', waktu) > :LastSync AND CONCAT(tanggal, '' '', waktu) <= :TargetSync) ' +
+      '   OR (notes REGEXP ''^[0-9]{4}-[0-9]{2}-[0-9]{2}'' AND notes > :LastSync AND notes <= :TargetSync)) ' +
+      'ORDER BY tanggal ASC, waktu ASC';
     qryLocal.ParamByName('LastSync').AsString := LastSyncStr;
     qryLocal.ParamByName('TargetSync').AsString := TargetSyncStr;
     qryLocal.Open;
@@ -30,23 +35,22 @@ begin
     Headers[1] := TNameValuePair.Create('Authorization', 'Bearer ' + SUPABASE_KEY);
     Headers[2] := TNameValuePair.Create('Content-Type', 'application/json');
     Headers[3] := TNameValuePair.Create('Prefer', 'resolution=merge-duplicates');
-    
-    SetLength(HeadersReturnMinimal, 4);
-    HeadersReturnMinimal[0] := TNameValuePair.Create('apikey', SUPABASE_KEY);
-    HeadersReturnMinimal[1] := TNameValuePair.Create('Authorization', 'Bearer ' + SUPABASE_KEY);
-    HeadersReturnMinimal[2] := TNameValuePair.Create('Content-Type', 'application/json');
-    HeadersReturnMinimal[3] := TNameValuePair.Create('Prefer', 'return=minimal');
 
     RecCount := 0;
     BulkPayment := SA();
     BulkMember := SA();
+    BulkLinkedMaster := SA();
+    BulkLinkedDetail := SA();
+    
+    memLogs.Lines.Add(Format('[SYNC-PAY] Found %d new/updated payment(s) in sync window.', [qryLocal.RecordCount]));
     
     while not qryLocal.Eof do
     begin
       Application.ProcessMessages;
+      sCurIdPayment := qryLocal.FieldByName('id_payment').AsString;
       
       JSONPayload := SO();
-      JSONPayload.S['id_payment'] := qryLocal.FieldByName('id_payment').AsString;
+      JSONPayload.S['id_payment'] := sCurIdPayment;
       JSONPayload.S['kode_outlet'] := APP_OUTLETID;
       if qryLocal.FieldByName('id_member').AsString <> '' then
         JSONPayload.S['user_uid'] := qryLocal.FieldByName('id_member').AsString
@@ -62,11 +66,12 @@ begin
       
       BulkPayment.Add(JSONPayload);
       
+      // Member points tracking
       if (qryLocal.FieldByName('id_member').AsString <> '') and 
          (qryLocal.FieldByName('id_member').AsString <> '(NONE)') then
       begin
         JSONMember := SO();
-        JSONMember.S['id_payment'] := qryLocal.FieldByName('id_payment').AsString;
+        JSONMember.S['id_payment'] := sCurIdPayment;
         JSONMember.S['user_uid'] := qryLocal.FieldByName('id_member').AsString;
         JSONMember.F['point_awal'] := qryLocal.FieldByName('point_awal').AsFloat;
         JSONMember.F['tambah_point'] := qryLocal.FieldByName('tambah_point').AsFloat;
@@ -75,56 +80,161 @@ begin
         BulkMember.Add(JSONMember);
       end;
 
-      qrySearchLocal.Close;
-      qrySearchLocal.SQL.Text := 'SELECT trans_id FROM trans_master WHERE id_payment = :idpay';
-      qrySearchLocal.ParamByName('idpay').AsString := qryLocal.FieldByName('id_payment').AsString;
-      qrySearchLocal.Open;
+      // 1. Reconcile and pull full trans_master records linked to this payment
+      qrySearchMaster.Close;
+      qrySearchMaster.SQL.Text := 
+        'SELECT tm.*, (SELECT k.kodekaryawan FROM ben_hrd_karyawan_info k WHERE k.idkaryawan = tm.therapist_id AND k.active = ''Y'' LIMIT 1) as kodekaryawan ' +
+        'FROM trans_master tm WHERE tm.id_payment = :idpay';
+      qrySearchMaster.ParamByName('idpay').AsString := sCurIdPayment;
+      qrySearchMaster.Open;
       
-      TransIDList.Clear;
-      while not qrySearchLocal.Eof do
+      while not qrySearchMaster.Eof do
       begin
-        TransIDList.Add('"' + qrySearchLocal.FieldByName('trans_id').AsString + '"');
-        qrySearchLocal.Next;
-      end;
-      
-      if TransIDList.Count > 0 then
-      begin
-        UpdatePayload := SO();
-        UpdatePayload.S['id_payment'] := qryLocal.FieldByName('id_payment').AsString;
+        JSONMasterRow := SO();
+        JSONMasterRow.S['trans_id'] := qrySearchMaster.FieldByName('trans_id').AsString;
+        JSONMasterRow.S['kode_outlet'] := APP_OUTLETID;
+        JSONMasterRow.S['start_time'] := qrySearchMaster.FieldByName('start_time').AsString;
+        JSONMasterRow.S['end_time'] := qrySearchMaster.FieldByName('end_time').AsString;
+        JSONMasterRow.S['tanggal'] := FormatDateTime('yyyy-mm-dd', qrySearchMaster.FieldByName('tanggal').AsDateTime);
+        JSONMasterRow.S['status_trans'] := qrySearchMaster.FieldByName('status_trans').AsString; // 'PAID'
+        JSONMasterRow.S['nama_customer'] := qrySearchMaster.FieldByName('nama_customer').AsString;
+        JSONMasterRow.S['room_id'] := APP_OUTLETID + '.' + qrySearchMaster.FieldByName('room_id').AsString;
+        JSONMasterRow.F['subtotal'] := qrySearchMaster.FieldByName('subtotal').AsFloat;
         
-        RequestBodyInner := TStringStream.Create(UpdatePayload.AsJSON, TEncoding.UTF8);
-        try
-          HTTP.Patch(SUPABASE_URL + 'ot_pos_trans_master?trans_id=in.(' + TransIDList.CommaText + ')', 
-            RequestBodyInner, nil, HeadersReturnMinimal);
-        finally
-          RequestBodyInner.Free;
-        end;
+        if qrySearchMaster.FieldByName('kodekaryawan').AsString <> '' then
+          JSONMasterRow.S['kodekaryawan'] := qrySearchMaster.FieldByName('kodekaryawan').AsString
+        else
+          JSONMasterRow.Null['kodekaryawan'] := jNull;
           
-        RequestBodyInner := TStringStream.Create(UpdatePayload.AsJSON, TEncoding.UTF8);
-        try
-          HTTP.Patch(SUPABASE_URL + 'ot_pos_trans_detail?trans_id=in.(' + TransIDList.CommaText + ')', 
-            RequestBodyInner, nil, HeadersReturnMinimal);
-        finally
-          RequestBodyInner.Free;
-        end;
+        if qrySearchMaster.FieldByName('byrequest').AsString <> '' then
+          JSONMasterRow.S['byrequest'] := qrySearchMaster.FieldByName('byrequest').AsString
+        else
+          JSONMasterRow.Null['byrequest'] := jNull;
+
+        if qrySearchMaster.FieldByName('typejasa').AsString <> '' then
+          JSONMasterRow.S['typejasa'] := qrySearchMaster.FieldByName('typejasa').AsString
+        else
+          JSONMasterRow.Null['typejasa'] := jNull;
+
+        if qrySearchMaster.FieldByName('rcpt').AsString <> '' then
+          JSONMasterRow.S['rcpt'] := qrySearchMaster.FieldByName('rcpt').AsString
+        else
+          JSONMasterRow.Null['rcpt'] := jNull;
+
+        JSONMasterRow.S['id_payment'] := sCurIdPayment;
+        
+        if qrySearchMaster.FieldByName('user_uid').AsString <> '' then
+          JSONMasterRow.S['user_uid'] := qrySearchMaster.FieldByName('user_uid').AsString
+        else
+          JSONMasterRow.Null['user_uid'] := jNull;
+
+        BulkLinkedMaster.Add(JSONMasterRow);
+        qrySearchMaster.Next;
+      end;
+
+      // 2. Reconcile and pull full trans_detail lines linked to this payment
+      qrySearchDetail.Close;
+      qrySearchDetail.SQL.Text := 
+        'SELECT td.*, (SELECT k.kodekaryawan FROM ben_hrd_karyawan_info k WHERE k.idkaryawan = td.teraphist_id AND k.active = ''Y'' LIMIT 1) as kodekaryawan ' +
+        'FROM trans_detail td WHERE td.payment_id = :idpay';
+      qrySearchDetail.ParamByName('idpay').AsString := sCurIdPayment;
+      qrySearchDetail.Open;
+
+      while not qrySearchDetail.Eof do
+      begin
+        JSONDetailRow := SO();
+        JSONDetailRow.S['trans_id'] := qrySearchDetail.FieldByName('id_trans').AsString;
+        JSONDetailRow.S['kode_outlet'] := APP_OUTLETID;
+        JSONDetailRow.S['tanggal'] := FormatDateTime('yyyy-mm-dd', qrySearchDetail.FieldByName('tanggal').AsDateTime);
+        JSONDetailRow.S['trans_type_id'] := qrySearchDetail.FieldByName('trans_type_id').AsString;
+        JSONDetailRow.S['produk_jasa_id'] := qrySearchDetail.FieldByName('produk_jasa_id').AsString;
+        JSONDetailRow.S['produk_jasa_nama'] := qrySearchDetail.FieldByName('produk_jasa_nama').AsString;
+        JSONDetailRow.F['disc_amount'] := qrySearchDetail.FieldByName('disc_amount').AsFloat;
+        JSONDetailRow.F['disc_percent'] := qrySearchDetail.FieldByName('disc_percent').AsFloat;
+        JSONDetailRow.F['subtotal'] := qrySearchDetail.FieldByName('subtotal').AsFloat;
+        JSONDetailRow.F['price'] := qrySearchDetail.FieldByName('harga').AsFloat;
+        JSONDetailRow.F['qty'] := qrySearchDetail.FieldByName('quantity').AsFloat;
+        JSONDetailRow.S['therapist_id'] := qrySearchDetail.FieldByName('teraphist_id').AsString;
+        JSONDetailRow.S['room_id'] := APP_OUTLETID + '.' + qrySearchDetail.FieldByName('room_id').AsString;
+        JSONDetailRow.S['aroma_oil'] := qrySearchDetail.FieldByName('aroma').AsString;
+        JSONDetailRow.I['lama'] := qrySearchDetail.FieldByName('lama').AsInteger;
+        JSONDetailRow.I['local_autonum'] := qrySearchDetail.FieldByName('autonum').AsInteger;
+        
+        if qrySearchDetail.FieldByName('kodekaryawan').AsString <> '' then
+          JSONDetailRow.S['kode_karyawan'] := qrySearchDetail.FieldByName('kodekaryawan').AsString
+        else
+          JSONDetailRow.Null['kode_karyawan'] := jNull;
+        
+        JSONDetailRow.S['id_payment'] := sCurIdPayment;
+          
+        if (qrySearchDetail.FieldByName('id_customer').AsString <> '') and (qrySearchDetail.FieldByName('id_customer').AsString <> '(NONE)') then
+          JSONDetailRow.S['user_uid'] := qrySearchDetail.FieldByName('id_customer').AsString
+        else
+          JSONDetailRow.Null['user_uid'] := jNull;
+
+        BulkLinkedDetail.Add(JSONDetailRow);
+        qrySearchDetail.Next;
       end;
       
       Inc(RecCount);
       qryLocal.Next;
     end;
     
+    // A. Bulk Upsert Payments to Supabase
     if BulkPayment.Length > 0 then
     begin
       RequestBody := TStringStream.Create(BulkPayment.AsJSON, TEncoding.UTF8);
       try
         Response := HTTP.Post(SUPABASE_URL + 'ot_pos_trans_payment?on_conflict=id_payment', RequestBody, nil, Headers);
         if (Response.StatusCode <> 200) and (Response.StatusCode <> 201) then
+        begin
           memLogs.Lines.Add('[!] Bulk Payment Upsert Error: ' + Response.ContentAsString);
+          raise Exception.Create('Payment Bulk Upsert Failed (' + IntToStr(Response.StatusCode) + '): ' + Response.ContentAsString);
+        end
+        else
+          memLogs.Lines.Add(Format('[SYNC-PAY] Upserted %d payment header(s) to Supabase (HTTP %d).', [BulkPayment.Length, Response.StatusCode]));
       finally
         RequestBody.Free;
       end;
     end;
     
+    // B. Bulk Upsert Linked Master records (reconciling status_trans = 'PAID' & id_payment)
+    if BulkLinkedMaster.Length > 0 then
+    begin
+      RequestBody := TStringStream.Create(BulkLinkedMaster.AsJSON, TEncoding.UTF8);
+      try
+        Response := HTTP.Post(SUPABASE_URL + 'ot_pos_trans_master?on_conflict=trans_id', RequestBody, nil, Headers);
+        if (Response.StatusCode <> 200) and (Response.StatusCode <> 201) then
+        begin
+          memLogs.Lines.Add('[!] Reconciled Master Bulk Upsert Error: ' + Response.ContentAsString);
+          raise Exception.Create('Reconciled Master Upsert Failed (' + IntToStr(Response.StatusCode) + '): ' + Response.ContentAsString);
+        end
+        else
+          memLogs.Lines.Add(Format('[SYNC-PAY] Reconciled and updated %d linked trans_master to PAID with id_payment (HTTP %d).', [BulkLinkedMaster.Length, Response.StatusCode]));
+      finally
+        RequestBody.Free;
+      end;
+    end;
+
+    // C. Bulk Upsert Linked Detail records (reconciling id_payment)
+    if BulkLinkedDetail.Length > 0 then
+    begin
+      RequestBody := TStringStream.Create(BulkLinkedDetail.AsJSON, TEncoding.UTF8);
+      try
+        Response := HTTP.Post(SUPABASE_URL + 'ot_pos_trans_detail?on_conflict=kode_outlet,local_autonum', RequestBody, nil, Headers);
+        if (Response.StatusCode <> 200) and (Response.StatusCode <> 201) then
+        begin
+          memLogs.Lines.Add('[!] Reconciled Detail Bulk Upsert Error: ' + Response.ContentAsString);
+          raise Exception.Create('Reconciled Detail Upsert Failed (' + IntToStr(Response.StatusCode) + '): ' + Response.ContentAsString);
+        end
+        else
+          memLogs.Lines.Add(Format('[SYNC-PAY] Reconciled and updated %d linked trans_detail with id_payment (HTTP %d).', [BulkLinkedDetail.Length, Response.StatusCode]));
+      finally
+        RequestBody.Free;
+      end;
+    end;
+
+    // D. Member point transactions
     if BulkMember.Length > 0 then
     begin
       RequestBody := TStringStream.Create(BulkMember.AsJSON, TEncoding.UTF8);
@@ -137,14 +247,15 @@ begin
       end;
     end;
     
-    if RecCount > 0 then memLogs.Lines.Add('Synced ' + IntToStr(RecCount) + ' Payments (Bulk).');
+    if RecCount > 0 then memLogs.Lines.Add(Format('POS Payment Sync cycle completed: %d payment(s) fully reconciled.', [RecCount]));
   finally
     qryLocal.Free;
-    qrySearchLocal.Free;
+    qrySearchMaster.Free;
+    qrySearchDetail.Free;
     HTTP.Free;
-    TransIDList.Free;
   end;
 end;
+
 
 procedure TfrmMain.SyncPosTransPaymentDetails(const LastSyncStr, TargetSyncStr: String);
 var
@@ -281,13 +392,18 @@ begin
       try
         Response := HTTP.Post(SUPABASE_URL + 'ot_pos_trans_payment_details?on_conflict=id_payment', RequestBody, nil, Headers);
         if (Response.StatusCode <> 200) and (Response.StatusCode <> 201) then
+        begin
           memLogs.Lines.Add('[!] Payment Details Bulk Upsert Error: ' + Response.ContentAsString);
+          raise Exception.Create('Payment Details Bulk Upsert Failed (' + IntToStr(Response.StatusCode) + '): ' + Response.ContentAsString);
+        end
+        else
+          memLogs.Lines.Add(Format('[SYNC-PAYDETAIL] Successfully upserted %d payment detail slips to Supabase (HTTP %d).', [BulkPaymentDetails.Length, Response.StatusCode]));
       finally
         RequestBody.Free;
       end;
     end;
     
-    if RecCount > 0 then memLogs.Lines.Add('Synced ' + IntToStr(RecCount) + ' Payment Details (Bulk).');
+    if RecCount > 0 then memLogs.Lines.Add(Format('POS Payment Details Sync cycle completed: %d slip(s) processed.', [RecCount]));
   finally
     qryLocal.Free;
     HTTP.Free;
@@ -345,24 +461,34 @@ begin
       if qryLocal.FieldByName('kodekaryawan').AsString <> '' then
         JSONPayload.S['kodekaryawan'] := qryLocal.FieldByName('kodekaryawan').AsString
       else
-        JSONPayload.O['kodekaryawan'] := nil;
+        JSONPayload.Null['kodekaryawan'] := jNull;
       
+      // Ensure all keys exist for every row to prevent PostgREST PGRST102 error
+      JSONPayload.Null['byrequest'] := jNull;
+      JSONPayload.Null['typejasa'] := jNull;
+      JSONPayload.Null['rcpt'] := jNull;
+
       if qryLocal.FieldByName('notes').AsString <> '' then
       begin
         try
           JSONMemo := SO(qryLocal.FieldByName('notes').AsString);
           if Assigned(JSONMemo) then
           begin
-            JSONPayload.S['byrequest'] := JSONMemo.S['byrequest'];
-            JSONPayload.S['typejasa'] := JSONMemo.S['typejasa'];
-            JSONPayload.S['rcpt'] := JSONMemo.S['user'];
+            if JSONMemo.S['byrequest'] <> '' then
+              JSONPayload.S['byrequest'] := JSONMemo.S['byrequest'];
+            if JSONMemo.S['typejasa'] <> '' then
+              JSONPayload.S['typejasa'] := JSONMemo.S['typejasa'];
+            if JSONMemo.S['user'] <> '' then
+              JSONPayload.S['rcpt'] := JSONMemo.S['user'];
           end;
         except
         end;
       end;
       
       if (qryLocal.FieldByName('id_payment').AsString <> '') and (qryLocal.FieldByName('id_payment').AsString <> '(NONE)') then
-        JSONPayload.S['id_payment'] := qryLocal.FieldByName('id_payment').AsString;
+        JSONPayload.S['id_payment'] := qryLocal.FieldByName('id_payment').AsString
+      else
+        JSONPayload.Null['id_payment'] := jNull;
 
       BulkMaster.Add(JSONPayload);
         
@@ -376,13 +502,18 @@ begin
       try
         Response := HTTP.Post(SUPABASE_URL + 'ot_pos_trans_master?on_conflict=trans_id', RequestBody, nil, Headers);
         if (Response.StatusCode <> 200) and (Response.StatusCode <> 201) then
+        begin
           memLogs.Lines.Add('[!] Trans Master Bulk Upsert Error: ' + Response.ContentAsString);
+          raise Exception.Create('Trans Master Bulk Upsert Failed (' + IntToStr(Response.StatusCode) + '): ' + Response.ContentAsString);
+        end
+        else
+          memLogs.Lines.Add(Format('[SYNC-MASTER] Successfully upserted %d master trans to Supabase (HTTP %d).', [BulkMaster.Length, Response.StatusCode]));
       finally
         RequestBody.Free;
       end;
     end;
     
-    if RecCount > 0 then memLogs.Lines.Add('Synced ' + IntToStr(RecCount) + ' Master Trans (Bulk).');
+    if RecCount > 0 then memLogs.Lines.Add(Format('POS Master Trans Sync cycle completed: %d record(s) processed.', [RecCount]));
   finally
     qryLocal.Free;
     HTTP.Free;
@@ -447,13 +578,17 @@ begin
       if qryLocal.FieldByName('kodekaryawan').AsString <> '' then
         JSONPayload.S['kode_karyawan'] := qryLocal.FieldByName('kodekaryawan').AsString
       else
-        JSONPayload.O['kode_karyawan'] := nil;
+        JSONPayload.Null['kode_karyawan'] := jNull;
       
       if (qryLocal.FieldByName('payment_id').AsString <> '') and (qryLocal.FieldByName('payment_id').AsString <> '(NONE)') then
-        JSONPayload.S['id_payment'] := qryLocal.FieldByName('payment_id').AsString;
+        JSONPayload.S['id_payment'] := qryLocal.FieldByName('payment_id').AsString
+      else
+        JSONPayload.Null['id_payment'] := jNull;
         
       if (qryLocal.FieldByName('id_customer').AsString <> '') and (qryLocal.FieldByName('id_customer').AsString <> '(NONE)') then
-        JSONPayload.S['user_uid'] := qryLocal.FieldByName('id_customer').AsString;
+        JSONPayload.S['user_uid'] := qryLocal.FieldByName('id_customer').AsString
+      else
+        JSONPayload.Null['user_uid'] := jNull;
 
       BulkDetail.Add(JSONPayload);
         
@@ -467,13 +602,18 @@ begin
       try
         Response := HTTP.Post(SUPABASE_URL + 'ot_pos_trans_detail?on_conflict=kode_outlet,local_autonum', RequestBody, nil, Headers);
         if (Response.StatusCode <> 200) and (Response.StatusCode <> 201) then
+        begin
           memLogs.Lines.Add('[!] Trans Detail Bulk Upsert Error: ' + Response.ContentAsString);
+          raise Exception.Create('Trans Detail Bulk Upsert Failed (' + IntToStr(Response.StatusCode) + '): ' + Response.ContentAsString);
+        end
+        else
+          memLogs.Lines.Add(Format('[SYNC-DETAIL] Successfully upserted %d detail trans to Supabase (HTTP %d).', [BulkDetail.Length, Response.StatusCode]));
       finally
         RequestBody.Free;
       end;
     end;
     
-    if RecCount > 0 then memLogs.Lines.Add('Synced ' + IntToStr(RecCount) + ' Detail Trans (Bulk).');
+    if RecCount > 0 then memLogs.Lines.Add(Format('POS Detail Trans Sync cycle completed: %d record(s) processed.', [RecCount]));
   finally
     qryLocal.Free;
     HTTP.Free;
@@ -543,7 +683,10 @@ begin
       try
         Response := HTTP.Post(SUPABASE_URL + 'ot_pos_trans_reject?on_conflict=kode_outlet,local_autonum', RequestBody, nil, Headers);
         if (Response.StatusCode <> 200) and (Response.StatusCode <> 201) then
+        begin
           memLogs.Lines.Add('[!] Trans Reject Bulk Upsert Error: ' + Response.ContentAsString);
+          raise Exception.Create('Trans Reject Bulk Upsert Failed (' + IntToStr(Response.StatusCode) + '): ' + Response.ContentAsString);
+        end;
       finally
         RequestBody.Free;
       end;
@@ -557,10 +700,61 @@ begin
 end;
 
 procedure TfrmMain.SyncPosTrans(const LastSyncStr, TargetSyncStr: String);
+var
+  bHasError: Boolean;
 begin
-  SyncPosTransPayment(LastSyncStr, TargetSyncStr);
-  SyncPosTransPaymentDetails(LastSyncStr, TargetSyncStr);
-  SyncPosTransMaster(LastSyncStr, TargetSyncStr);
-  SyncPosTransDetail(LastSyncStr, TargetSyncStr);
-  SyncPosTransReject(LastSyncStr, TargetSyncStr);
+  bHasError := False;
+
+  try
+    SyncPosTransPayment(LastSyncStr, TargetSyncStr);
+  except
+    on E: Exception do 
+    begin
+      memLogs.Lines.Add('[!] Error SyncPosTransPayment: ' + E.Message);
+      bHasError := True;
+    end;
+  end;
+
+  try
+    SyncPosTransPaymentDetails(LastSyncStr, TargetSyncStr);
+  except
+    on E: Exception do 
+    begin
+      memLogs.Lines.Add('[!] Error SyncPosTransPaymentDetails: ' + E.Message);
+      bHasError := True;
+    end;
+  end;
+
+  try
+    SyncPosTransMaster(LastSyncStr, TargetSyncStr);
+  except
+    on E: Exception do 
+    begin
+      memLogs.Lines.Add('[!] Error SyncPosTransMaster: ' + E.Message);
+      bHasError := True;
+    end;
+  end;
+
+  try
+    SyncPosTransDetail(LastSyncStr, TargetSyncStr);
+  except
+    on E: Exception do 
+    begin
+      memLogs.Lines.Add('[!] Error SyncPosTransDetail: ' + E.Message);
+      bHasError := True;
+    end;
+  end;
+
+  try
+    SyncPosTransReject(LastSyncStr, TargetSyncStr);
+  except
+    on E: Exception do 
+    begin
+      memLogs.Lines.Add('[!] Error SyncPosTransReject: ' + E.Message);
+      bHasError := True;
+    end;
+  end;
+
+  if bHasError then
+    raise Exception.Create('POS Sync cycle had one or more failed sub-processes. Chunk anchor preserved for retry.');
 end;

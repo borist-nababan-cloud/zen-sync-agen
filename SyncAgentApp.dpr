@@ -8,7 +8,8 @@ uses
   MainSource in 'uses\MainSource.pas',
   uHTTP in 'uses\uHTTP.pas',
   XSuperJSON in 'uses\XSuperJSON.pas',
-  XSuperObject in 'uses\XSuperObject.pas';
+  XSuperObject in 'uses\XSuperObject.pas',
+  FManualSync in 'FManualSync.pas' {frmManualSync};
 
 {$R *.res}
 

@@ -36,17 +36,33 @@ type
     lblCounter: TLabel;
     edLLineCount: TcxCalcEdit;
     Label1: TLabel;
+    btnManualSync: TcxButton;
+    TrayIcon1: TTrayIcon;
+    pmTray: TPopupMenu;
+    miShow: TMenuItem;
+    miManualSync: TMenuItem;
+    miSep: TMenuItem;
+    miExit: TMenuItem;
+    tmrRate: TTimer;
     procedure btnSetupConfigClick(Sender: TObject);
     procedure FormCreate(Sender: TObject);
     procedure FormShow(Sender: TObject);
+    procedure FormCloseQuery(Sender: TObject; var CanClose: Boolean);
+    procedure TrayIcon1DblClick(Sender: TObject);
+    procedure miShowClick(Sender: TObject);
+    procedure miExitClick(Sender: TObject);
     procedure tmrConnectDBTimer(Sender: TObject);
     procedure tmSyncTimer(Sender: TObject);
     procedure btnSaveLogsClick(Sender: TObject);
     procedure memLogsChange(Sender: TObject);
     procedure btnStartStopClick(Sender: TObject);
+    procedure btnManualSyncClick(Sender: TObject);
+    procedure tmrRateTimer(Sender: TObject);
   private
     { Private declarations }
     DBConnectAttempt: Integer;
+    FAllowClose: Boolean;
+    function PromptExitPassword(var APassword: string): Boolean;
     procedure LoadConfigApps;
     procedure SyncHRDInfo(const LastSyncStr, TargetSyncStr: String);
     procedure SyncAbsen(const LastSyncStr, TargetSyncStr: String);
@@ -57,7 +73,12 @@ type
     procedure SyncPosTransMaster(const LastSyncStr, TargetSyncStr: String);
     procedure SyncPosTransDetail(const LastSyncStr, TargetSyncStr: String);
     procedure SyncPosTransReject(const LastSyncStr, TargetSyncStr: String);
+    procedure SyncPosGCSold(const LastSyncStr, TargetSyncStr: String);
     procedure SyncPosTrans(const LastSyncStr, TargetSyncStr: String);
+    procedure SyncGuestRating;
+    procedure ApplicationEventsException(Sender: TObject; E: Exception);
+    procedure StopSync;
+    procedure StartSync;
   public
     { Public declarations }
     LOCAL_DBNAME, LOCAL_DBUSER, LOCAL_DBHOST, LOCAL_DBPASS, LOCAL_DBPORT,
@@ -81,7 +102,8 @@ implementation
 
 {$R *.dfm}
 
-uses FConfigSetup, FdmDB, MainSource, System.Net.HttpClient, System.Net.URLClient, System.DateUtils, Data.DB;
+uses FConfigSetup, FdmDB, MainSource, System.Net.HttpClient, System.Net.URLClient,
+     System.DateUtils, Data.DB, FManualSync;
 
 procedure TfrmMain.LoadConfigApps;
 var
@@ -142,8 +164,10 @@ begin
       // Supabase settings
       if ConfigJSON.Contains('Supabase') then
       begin
-        SUPABASE_URL := DecryptPass(ConfigJSON.O['Supabase'].S['REST_URL']);
-        SUPABASE_KEY := DecryptPass(ConfigJSON.O['Supabase'].S['PublishableKey']);
+        SUPABASE_URL := Trim(DecryptPass(ConfigJSON.O['Supabase'].S['REST_URL']));
+        if (SUPABASE_URL <> '') and not (SUPABASE_URL[Length(SUPABASE_URL)] in ['/', '\']) then
+          SUPABASE_URL := SUPABASE_URL + '/';
+        SUPABASE_KEY := Trim(DecryptPass(ConfigJSON.O['Supabase'].S['PublishableKey']));
       end;
     end;
   finally
@@ -170,6 +194,8 @@ var
 begin
   qryAbsen1 := TMyQuery.Create(Self);
   HTTP := THTTPClient.Create;
+  HTTP.ConnectionTimeout := 10000;
+  HTTP.ResponseTimeout := 30000;
   try
     qryAbsen1.Connection := DMDB.dbInternal;
     
@@ -257,7 +283,10 @@ begin
     end;
   except
     on E: Exception do
+    begin
       memLogs.Lines.Add('Sync Absen Error: ' + E.Message);
+      raise;
+    end;
   end;
   
   qryAbsen1.Free;
@@ -277,6 +306,8 @@ begin
   qryInfo := TMyQuery.Create(Self);
   qryDetails := TMyQuery.Create(Self);
   HTTP := THTTPClient.Create;
+  HTTP.ConnectionTimeout := 10000;
+  HTTP.ResponseTimeout := 30000;
   try
     qryInfo.Connection := DMDB.dbInternal;
     qryDetails.Connection := DMDB.dbInternal;
@@ -316,7 +347,7 @@ begin
           JSONObj.S['tglmasukkerja'] := FormatDateTime('yyyy-mm-dd', qryInfo.FieldByName('tglmasukkerja').AsDateTime);
         if not qryInfo.FieldByName('tglhabiskontrak').IsNull then
           JSONObj.S['tglhabiskontrak'] := FormatDateTime('yyyy-mm-dd', qryInfo.FieldByName('tglhabiskontrak').AsDateTime);
-          
+
         JSONObj.S['namabank'] := qryInfo.FieldByName('namabank').AsString;
         JSONObj.S['norek'] := qryInfo.FieldByName('norek').AsString;
         JSONObj.S['namarek'] := qryInfo.FieldByName('namarek').AsString;
@@ -401,7 +432,10 @@ begin
     end;
   except
     on E: Exception do
+    begin
       memLogs.Lines.Add('Sync HRD Error: ' + E.Message);
+      raise;
+    end;
   end;
   
   qryInfo.Free;
@@ -421,6 +455,8 @@ var
 begin
   qryRekap := TMyQuery.Create(Self);
   HTTP := THTTPClient.Create;
+  HTTP.ConnectionTimeout := 10000;
+  HTTP.ResponseTimeout := 30000;
   try
     qryRekap.Connection := DMDB.dbInternal;
     
@@ -501,7 +537,10 @@ begin
     end;
   except
     on E: Exception do
+    begin
       memLogs.Lines.Add('Sync Presensi Rekap Error: ' + E.Message);
+      raise;
+    end;
   end;
   
   qryRekap.Free;
@@ -521,6 +560,8 @@ var
 begin
   qryPayroll := TMyQuery.Create(Self);
   HTTP := THTTPClient.Create;
+  HTTP.ConnectionTimeout := 10000;
+  HTTP.ResponseTimeout := 30000;
   try
     qryPayroll.Connection := DMDB.dbInternal;
     
@@ -555,6 +596,12 @@ begin
         // Explicitly set nilaithp for fast dashboard querying (as requested)
         if not qryPayroll.FieldByName('nilaithp').IsNull then
           JSONObj.S['nilaithp'] := StringReplace(FloatToStr(qryPayroll.FieldByName('nilaithp').AsFloat), ',', '.', [rfReplaceAll]);
+        
+        // Explicitly set payrollperiode for fast period filtering
+        if not qryPayroll.FieldByName('payrollperiode').IsNull then
+          JSONObj.S['payrollperiode'] := qryPayroll.FieldByName('payrollperiode').AsString
+        else
+          JSONObj.Null['payrollperiode'] := jNull;
         
         // Create the nested JSON for all dynamic payroll metrics
         JSONData := SO();
@@ -599,7 +646,10 @@ begin
     end;
   except
     on E: Exception do
+    begin
       memLogs.Lines.Add('Sync Payroll Error: ' + E.Message);
+      raise;
+    end;
   end;
   
   qryPayroll.Free;
@@ -607,13 +657,137 @@ begin
 end;
 
 {$I PosSync.pas}
+{$I RateSync.pas}
+
+function TfrmMain.PromptExitPassword(var APassword: string): Boolean;
+var
+  Dlg: TForm;
+  lbl: TLabel;
+  edt: TEdit;
+  btnOk, btnCancel: TButton;
+begin
+  Result := False;
+  Dlg := TForm.Create(nil);
+  try
+    Dlg.Position := poScreenCenter;
+    Dlg.BorderStyle := bsDialog;
+    Dlg.BorderIcons := [biSystemMenu];
+    Dlg.Caption := 'Security Verification';
+    Dlg.ClientWidth := 300;
+    Dlg.ClientHeight := 130;
+    Dlg.Font.Name := 'Tahoma';
+    Dlg.Font.Size := 9;
+
+    lbl := TLabel.Create(Dlg);
+    lbl.Parent := Dlg;
+    lbl.SetBounds(16, 16, 268, 16);
+    lbl.Caption := 'Enter password to exit Sync Agent:';
+
+    edt := TEdit.Create(Dlg);
+    edt.Parent := Dlg;
+    edt.SetBounds(16, 40, 268, 24);
+    edt.PasswordChar := '*';
+
+    btnOk := TButton.Create(Dlg);
+    btnOk.Parent := Dlg;
+    btnOk.SetBounds(126, 85, 75, 28);
+    btnOk.Caption := 'OK';
+    btnOk.Default := True;
+    btnOk.ModalResult := mrOk;
+
+    btnCancel := TButton.Create(Dlg);
+    btnCancel.Parent := Dlg;
+    btnCancel.SetBounds(209, 85, 75, 28);
+    btnCancel.Caption := 'Cancel';
+    btnCancel.Cancel := True;
+    btnCancel.ModalResult := mrCancel;
+
+    if Dlg.ShowModal = mrOk then
+    begin
+      APassword := edt.Text;
+      Result := True;
+    end;
+  finally
+    Dlg.Free;
+  end;
+end;
 
 procedure TfrmMain.FormCreate(Sender: TObject);
 begin
+  Application.OnException := ApplicationEventsException;
+  FAllowClose := False;
+  TrayIcon1.Visible := True;
+  TrayIcon1.Hint := 'Zen Sync Agent - Active';
   memLogs.Lines.Clear;
   memLogs.Lines.Add('Application Started. Loading config...');
   DBConnectAttempt := 0;
   LoadConfigApps;
+end;
+
+procedure TfrmMain.FormCloseQuery(Sender: TObject; var CanClose: Boolean);
+begin
+  if FAllowClose then
+  begin
+    CanClose := True;
+    Exit;
+  end;
+
+  // Option 3: Do NOT terminate on [X], Alt+F4, or Taskbar close.
+  // Instead, minimize to system tray so synchronization continues uninterrupted.
+  CanClose := False;
+  Hide;
+  WindowState := wsMinimized;
+  TrayIcon1.Visible := True;
+  TrayIcon1.BalloonTitle := 'Zen Sync Agent';
+  TrayIcon1.BalloonHint := 'Sync Agent is minimized to the system tray. Background synchronization remains active.';
+  TrayIcon1.BalloonFlags := bfInfo;
+  TrayIcon1.BalloonTimeout := 3000;
+  TrayIcon1.ShowBalloonHint;
+  memLogs.Lines.Add(Format('[SYSTEM] %s - Application minimized to system tray. Synchronization remains active.', [FormatDateTime('yyyy-mm-dd hh:nn:ss', Now)]));
+end;
+
+procedure TfrmMain.TrayIcon1DblClick(Sender: TObject);
+begin
+  Show;
+  WindowState := wsNormal;
+  Application.BringToFront;
+  BringToFront;
+end;
+
+procedure TfrmMain.miShowClick(Sender: TObject);
+begin
+  TrayIcon1DblClick(Sender);
+end;
+
+procedure TfrmMain.miExitClick(Sender: TObject);
+var
+  sInputPass, sExpectedPass: string;
+begin
+  sExpectedPass := 'ZenSpa168';
+  if (ConfigJSON <> nil) then
+  begin
+    if ConfigJSON.S['ExitPassword'] <> '' then
+      sExpectedPass := ConfigJSON.S['ExitPassword']
+    else if ConfigJSON.Contains('AppInfo') and (ConfigJSON.O['AppInfo'].S['ExitPassword'] <> '') then
+      sExpectedPass := ConfigJSON.O['AppInfo'].S['ExitPassword'];
+  end;
+
+  if PromptExitPassword(sInputPass) then
+  begin
+    if sInputPass = sExpectedPass then
+    begin
+      memLogs.Lines.Add(Format('[SECURITY] %s - Authorized exit password entered. Shutting down Sync Agent...', [FormatDateTime('yyyy-mm-dd hh:nn:ss', Now)]));
+      FAllowClose := True;
+      tmSync.Enabled := False;
+      tmrRate.Enabled := False;
+      tmrConnectDB.Enabled := False;
+      Close;
+    end
+    else
+    begin
+      memLogs.Lines.Add(Format('[SECURITY] %s - Unauthorized exit attempt with invalid password.', [FormatDateTime('yyyy-mm-dd hh:nn:ss', Now)]));
+    end;
+  end;
 end;
 
 procedure TfrmMain.tmrConnectDBTimer(Sender: TObject);
@@ -646,8 +820,11 @@ begin
     // Wire up and start the synchronization timer dynamically
     tmSync.Interval := 60000; // 1 minute
     tmSync.OnTimer := tmSyncTimer;
-    tmSync.Enabled := True;
-    memLogs.Lines.Add('Sync Timer started (1 min interval).');
+    tmrRate.Interval := 5000; // 5 seconds
+    tmrRate.OnTimer := tmrRateTimer;
+    btnStartStop.Click;
+//    tmSync.Enabled := True;
+//    memLogs.Lines.Add('Sync Timer started (1 min interval).');
   except
     on E: Exception do
     begin
@@ -671,26 +848,53 @@ procedure TfrmMain.btnSetupConfigClick(Sender: TObject);
 begin
     Application.CreateForm(TfrmConfigSetup, frmConfigSetup);
     tmSync.Enabled := False;
+    tmrRate.Enabled := False;
     lblCounter.Caption := 'TIMER STOPED';
     lblCounter.Font.Color := clRed;
     frmConfigSetup.Show;
 end;
 
+procedure TfrmMain.ApplicationEventsException(Sender: TObject; E: Exception);
+begin
+  memLogs.Lines.Add('[!] System Exception: ' + E.Message + '. Auto-retry on next cycle.');
+  tmSync.Enabled := True;
+end;
+
+procedure TfrmMain.StopSync;
+begin
+  tmSync.Enabled := False;
+  tmrRate.Enabled := False;
+  lblCounter.Caption := 'TIMER STOPED';
+  lblCounter.Font.Color := clRed;
+  memLogs.Lines.Add('Sync Timer Stopped');
+end;
+
+procedure TfrmMain.StartSync;
+begin
+  tmSync.Enabled := True;
+  tmrRate.Enabled := True;
+  lblCounter.Caption := 'TIMER START';
+  lblCounter.Font.Color := clGreen;
+  memLogs.Lines.Add('Sync Timer started (1 min interval).');
+  memLogs.Lines.Add('Guest Rating Timer started (5s interval).');
+end;
+
+procedure TfrmMain.tmrRateTimer(Sender: TObject);
+begin
+  tmrRate.Enabled := False;
+  try
+    SyncGuestRating;
+  finally
+    tmrRate.Enabled := True;
+  end;
+end;
+
 procedure TfrmMain.btnStartStopClick(Sender: TObject);
 begin
-     if (tmSync.Enabled = False) then
-         begin
-              tmSync.Enabled := True;
-              lblCounter.Caption := 'TIMER START';
-              lblCounter.Font.Color := clGreen;
-         end
-     else if (tmSync.Enabled = True) then
-         begin
-              tmSync.Enabled := False;
-              lblCounter.Caption := 'TIMER STOPED';
-              lblCounter.Font.Color := clRed;
-         end;
-
+  if (tmSync.Enabled = False) and (lblCounter.Caption <> 'TIMER START') then
+    StartSync
+  else
+    StopSync;
 end;
 
 procedure TfrmMain.tmSyncTimer(Sender: TObject);
@@ -699,78 +903,167 @@ var
   CurrentSyncTime, SyncTargetTime, LastSyncTime: TDateTime;
   sLastSyncStr, sSyncTargetStr: String;
   FS: TFormatSettings;
+  bSyncFailed, bMySQLAlive: Boolean;
+  HTTPCheck: THTTPClient;
+  CheckHeaders: TNetHeaders;
+  CheckResp: IHTTPResponse;
 begin
   tmSync.Enabled := False;
+  bSyncFailed := False;
   if (edLLineCount.EditValue >= 2000) then
   begin
        memLogs.Clear;
   end;
+
+  // 1. Pre-flight Check: Local MySQL Connection Health & Ping
+  try
+    if not dmDB.dbInternal.Connected then
+    begin
+      memLogs.Lines.Add('[!] Local MySQL connection inactive. Attempting reconnection...');
+      dmDB.dbInternal.Connected := True;
+    end
+    else
+    begin
+      // Ping sends a MySQL ping packet; raises EMyError if the server dropped the connection
+      dmDB.dbInternal.Ping;
+    end;
+    bMySQLAlive := dmDB.dbInternal.Connected;
+  except
+    on E: Exception do
+    begin
+      memLogs.Lines.Add('[!] Local MySQL ping/reconnect failed: ' + E.Message);
+      try
+        dmDB.dbInternal.Connected := False;
+        dmDB.dbInternal.Connected := True;
+        bMySQLAlive := dmDB.dbInternal.Connected;
+      except
+        bMySQLAlive := False;
+      end;
+    end;
+  end;
+
+  if not bMySQLAlive then
+  begin
+    memLogs.Lines.Add('[!] Local MySQL offline/unreachable. Chunk anchor preserved. Retrying in 1 min...');
+    tmSync.Enabled := True; // Keep timer active for auto-retry
+    Exit;
+  end;
+
+  // 2. Pre-flight Check: Supabase Cloud Connectivity (Internet connection check)
+  HTTPCheck := THTTPClient.Create;
+  try
+    HTTPCheck.ConnectionTimeout := 5000; // 5s connection timeout
+    HTTPCheck.ResponseTimeout := 8000;   // 8s response timeout
+    SetLength(CheckHeaders, 2);
+    CheckHeaders[0] := TNameValuePair.Create('apikey', SUPABASE_KEY);
+    CheckHeaders[1] := TNameValuePair.Create('Authorization', 'Bearer ' + SUPABASE_KEY);
+    try
+      CheckResp := HTTPCheck.Get(SUPABASE_URL + 'master_outlet?select=kode_outlet&limit=1', nil, CheckHeaders);
+      if (CheckResp.StatusCode <> 200) and (CheckResp.StatusCode <> 206) then
+      begin
+        memLogs.Lines.Add(Format('[!] Supabase Cloud health check returned HTTP %d. Network/cloud unavailable. Retrying in 1 min...', [CheckResp.StatusCode]));
+        tmSync.Enabled := True; // Keep timer active for auto-retry
+        Exit;
+      end;
+    except
+      on E: Exception do
+      begin
+        memLogs.Lines.Add('[!] Supabase Cloud unreachable (Internet connection lost/offline): ' + E.Message + '. Retrying in 1 min...');
+        tmSync.Enabled := True; // Keep timer active for auto-retry
+        Exit;
+      end;
+    end;
+  finally
+    HTTPCheck.Free;
+  end;
+
   CurrentSyncTime := Now;
   
   qryConfig := TMyQuery.Create(Self);
   try
-    qryConfig.Connection := DMDB.dbInternal;
-    qryConfig.SQL.Text := 'SELECT details FROM configapp WHERE configname = ''LAST_SYNC''';
-    qryConfig.Open;
-    
-    if qryConfig.IsEmpty then
-    begin
-      qryConfig.SQL.Text := 'INSERT INTO configapp (configname, details) VALUES (''LAST_SYNC'', :dt)';
-      qryConfig.ParamByName('dt').AsString := FormatDateTime('yyyy-mm-dd hh:nn:ss', CurrentSyncTime);
-      qryConfig.Execute;
-      sLastSyncStr := '2026-09-01 00:00:00'; // Default safe past date
-      LastSyncTime := EncodeDateTime(2026, 9, 1, 0, 0, 0, 0);
-    end
-    else
-    begin
-      sLastSyncStr := qryConfig.FieldByName('details').AsString;
+    try
+      qryConfig.Connection := DMDB.dbInternal;
+      qryConfig.SQL.Text := 'SELECT details FROM configapp WHERE configname = ''LAST_SYNC''';
+      qryConfig.Open;
       
-      // Setup FormatSettings to handle SQL format robustly
-      FS := TFormatSettings.Create('en-US');
-      FS.DateSeparator := '-';
-      FS.TimeSeparator := ':';
-      FS.ShortDateFormat := 'yyyy-mm-dd';
-      
-      // TryStrToDateTime prevents the Delphi IDE debugger from interrupting with EConvertError
-      if not TryStrToDateTime(sLastSyncStr, LastSyncTime, FS) then
+      if qryConfig.IsEmpty then
       begin
+        qryConfig.SQL.Text := 'INSERT INTO configapp (configname, details) VALUES (''LAST_SYNC'', :dt)';
+        qryConfig.ParamByName('dt').AsString := FormatDateTime('yyyy-mm-dd hh:nn:ss', CurrentSyncTime);
+        qryConfig.Execute;
+        sLastSyncStr := '2026-09-01 00:00:00'; // Default safe past date
         LastSyncTime := EncodeDateTime(2026, 9, 1, 0, 0, 0, 0);
-        sLastSyncStr := '2026-09-01 00:00:00';
+      end
+      else
+      begin
+        sLastSyncStr := qryConfig.FieldByName('details').AsString;
+        
+        // Setup FormatSettings to handle SQL format robustly
+        FS := TFormatSettings.Create('en-US');
+        FS.DateSeparator := '-';
+        FS.TimeSeparator := ':';
+        FS.ShortDateFormat := 'yyyy-mm-dd';
+        
+        // TryStrToDateTime prevents the Delphi IDE debugger from interrupting with EConvertError
+        if not TryStrToDateTime(sLastSyncStr, LastSyncTime, FS) then
+        begin
+          LastSyncTime := EncodeDateTime(2026, 9, 1, 0, 0, 0, 0);
+          sLastSyncStr := '2026-09-01 00:00:00';
+        end;
+      end;
+      
+      // Time-based chunking (12 hours per cycle to avoid memory blowouts)
+      if (CurrentSyncTime - LastSyncTime) > 0.5 then
+        SyncTargetTime := LastSyncTime + 0.5
+      else
+        SyncTargetTime := CurrentSyncTime;
+        
+      sSyncTargetStr := FormatDateTime('yyyy-mm-dd hh:nn:ss', SyncTargetTime);
+      
+      memLogs.Lines.Add('--------------------------------------------------');
+      memLogs.Lines.Add('Starting Global Sync Cycle (Chunked)...');
+      memLogs.Lines.Add('Sync Window: ' + sLastSyncStr + ' TO ' + sSyncTargetStr);
+
+      // Call individual sync routines in dependency order
+      SyncHRDInfo(sLastSyncStr, sSyncTargetStr);
+      SyncAbsen(sLastSyncStr, sSyncTargetStr);
+      SyncRekapAbsen(sLastSyncStr, sSyncTargetStr);
+      SyncPayrollDetails(sLastSyncStr, sSyncTargetStr);
+      SyncPosTrans(sLastSyncStr, sSyncTargetStr);
+
+      // Update global anchor to the chunk target
+      qryConfig.SQL.Text := 'UPDATE configapp SET details = :dt WHERE configname = ''LAST_SYNC''';
+      qryConfig.ParamByName('dt').AsString := sSyncTargetStr;
+      qryConfig.Execute;
+      
+      memLogs.Lines.Add('Global Sync Cycle chunk completed. Anchor updated.');
+    except
+      on E: Exception do
+      begin
+        bSyncFailed := True;
+        memLogs.Lines.Add('Global Sync Error: ' + E.Message);
       end;
     end;
-    
-    // Time-based chunking (12 hours per cycle to avoid memory blowouts)
-    if (CurrentSyncTime - LastSyncTime) > 0.5 then 
-      SyncTargetTime := LastSyncTime + 0.5
-    else
-      SyncTargetTime := CurrentSyncTime;
-      
-    sSyncTargetStr := FormatDateTime('yyyy-mm-dd hh:nn:ss', SyncTargetTime);
-    
-    memLogs.Lines.Add('--------------------------------------------------');
-    memLogs.Lines.Add('Starting Global Sync Cycle (Chunked)...');
-    memLogs.Lines.Add('Sync Window: ' + sLastSyncStr + ' TO ' + sSyncTargetStr);
-
-    // Call individual sync routines in dependency order
-     SyncHRDInfo(sLastSyncStr, sSyncTargetStr);
-     SyncAbsen(sLastSyncStr, sSyncTargetStr);
-     SyncRekapAbsen(sLastSyncStr, sSyncTargetStr);
-     SyncPayrollDetails(sLastSyncStr, sSyncTargetStr);
-     SyncPosTrans(sLastSyncStr, sSyncTargetStr);
-
-    // Update global anchor to the chunk target
-    qryConfig.SQL.Text := 'UPDATE configapp SET details = :dt WHERE configname = ''LAST_SYNC''';
-    qryConfig.ParamByName('dt').AsString := sSyncTargetStr;
-    qryConfig.Execute;
-    
-    memLogs.Lines.Add('Global Sync Cycle chunk completed. Anchor updated.');
-  except
-    on E: Exception do
-      memLogs.Lines.Add('Global Sync Error: ' + E.Message);
+  finally
+    qryConfig.Free;
   end;
   
-  qryConfig.Free;
-  tmSync.Enabled := True; // Resume timer for next interval
+  if bSyncFailed then
+  begin
+    memLogs.Lines.Add('[!] Sub-routine failure detected. Chunk anchor preserved. Auto-retrying in 1 min...');
+    tmSync.Enabled := True; // Auto-retry on next cycle!
+  end
+  else
+  begin
+    tmSync.Enabled := True; // Resume timer for next interval
+  end;
+end;
+
+procedure TfrmMain.btnManualSyncClick(Sender: TObject);
+begin
+    StopSync;
+    Application.CreateForm(TfrmManualSync, frmManualSync);
+    frmManualSync.ShowModal;
 end;
 
 procedure TfrmMain.btnSaveLogsClick(Sender: TObject);

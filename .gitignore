@@ -1,14 +1,24 @@
-# Directories to ignore
+# Directories to ignore (with all files inside)
 Win32/
+Win32/**
 docs/
-__recovery/
-__history/
+docs/**
 .antigraviy/
+.antigraviy/**
+.antigravity/
+.antigravity/**
+__recovery/
+__recovery/**
+__history/
+__history/**
 .idea/
+.idea/**
 .vscode/
+.vscode/**
 
 # Sensitive data and configuration files
 .env
+.env*
 *.env
 *.sql
 *.ini
@@ -18,10 +28,12 @@ config.json
 *.log
 *.txt
 SyncLogs_*.txt
+*.bak
 
 # Python utility scripts
 inject_pos_sync.py
 __pycache__/
+__pycache__/**
 
 # Markdown documentation files
 *.md

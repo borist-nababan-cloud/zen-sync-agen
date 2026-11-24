@@ -3,7 +3,7 @@ object frmMain: TfrmMain
   Top = 0
   Caption = 'Sync Application Zen Family Spa'
   ClientHeight = 541
-  ClientWidth = 646
+  ClientWidth = 705
   Color = clBtnFace
   Font.Charset = DEFAULT_CHARSET
   Font.Color = clWindowText
@@ -11,16 +11,17 @@ object frmMain: TfrmMain
   Font.Name = 'Tahoma'
   Font.Style = []
   OldCreateOrder = False
+  OnCloseQuery = FormCloseQuery
   OnCreate = FormCreate
   OnShow = FormShow
   DesignSize = (
-    646
+    705
     541)
   PixelsPerInch = 96
   TextHeight = 13
   object lblCounter: TLabel
-    Left = 503
-    Top = 51
+    Left = 566
+    Top = 67
     Width = 125
     Height = 19
     Alignment = taRightJustify
@@ -32,16 +33,16 @@ object frmMain: TfrmMain
     Font.Name = 'Tahoma'
     Font.Style = [fsBold]
     ParentFont = False
-    ExplicitLeft = 492
   end
   object Label1: TLabel
-    Left = 444
-    Top = 79
+    Left = 513
+    Top = 100
     Width = 51
     Height = 13
     Alignment = taRightJustify
     Anchors = [akTop, akRight]
     Caption = 'Line Count'
+    ExplicitLeft = 454
   end
   object btnSetupConfig: TcxButton
     Left = 8
@@ -54,9 +55,9 @@ object frmMain: TfrmMain
   end
   object memLogs: TMemo
     Left = 8
-    Top = 108
-    Width = 630
-    Height = 425
+    Top = 128
+    Width = 689
+    Height = 405
     Anchors = [akLeft, akTop, akRight, akBottom]
     Color = clBlack
     Font.Charset = DEFAULT_CHARSET
@@ -72,7 +73,7 @@ object frmMain: TfrmMain
   end
   object btnSaveLogs: TcxButton
     Left = 8
-    Top = 77
+    Top = 97
     Width = 101
     Height = 25
     Caption = 'Save Logs'
@@ -89,12 +90,21 @@ object frmMain: TfrmMain
     OnClick = btnStartStopClick
   end
   object edLLineCount: TcxCalcEdit
-    Left = 507
-    Top = 76
+    Left = 576
+    Top = 97
     Anchors = [akTop, akRight]
     EditValue = 0.000000000000000000
     TabOrder = 4
     Width = 121
+  end
+  object btnManualSync: TcxButton
+    Left = 8
+    Top = 66
+    Width = 101
+    Height = 25
+    Caption = 'Manual Sync'
+    TabOrder = 5
+    OnClick = btnManualSyncClick
   end
   object tmrConnectDB: TTimer
     Interval = 5000
@@ -111,5 +121,38 @@ object frmMain: TfrmMain
   object SaveDialog1: TSaveDialog
     Left = 212
     Top = 20
+  end
+  object TrayIcon1: TTrayIcon
+    PopupMenu = pmTray
+    OnDblClick = TrayIcon1DblClick
+    Left = 424
+    Top = 52
+  end
+  object pmTray: TPopupMenu
+    Left = 464
+    Top = 52
+    object miShow: TMenuItem
+      Caption = 'Show Sync Agent'
+      Default = True
+      OnClick = miShowClick
+    end
+    object miManualSync: TMenuItem
+      Caption = 'Manual Sync...'
+      OnClick = btnManualSyncClick
+    end
+    object miSep: TMenuItem
+      Caption = '-'
+    end
+    object miExit: TMenuItem
+      Caption = 'Exit Application...'
+      OnClick = miExitClick
+    end
+  end
+  object tmrRate: TTimer
+    Enabled = False
+    Interval = 5000
+    OnTimer = tmrRateTimer
+    Left = 348
+    Top = 32
   end
 end
